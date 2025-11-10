@@ -1,0 +1,253 @@
+//6️⃣ Kotlin‑Quellcode (alle Dateien)
+
+//6.1 CertManagerApplication.kt
+// – Initialisiert WorkManagerpackage
+
+ com.deinunternehmen.cert_manager_automonimport
+ android.app.Application
+
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkManager
+import java.util.concurrent.TimeUnitclass
+ CertManagerApplication : Application() {override fun onCreate() {
+    super.onCreate()
+    schedulePeriodicCheck()}private fun schedulePeriodicCheck() {
+    val workRequest = PeriodicWorkRequestBuilder<CertMonitorWorker>(1, TimeUnit.HOURS)
+        .setConstraints(
+            androidx.work.Constraints.Builder()
+                .setRequiredNetworkType(androidx.work.NetworkType.CONNECTED)
+                .build()
+        )        .build()
+    WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+        "cert_monitor_work",
+        ExistingPeriodicWorkPolicy.KEEP,
+        workRequest
+    )}}
+
+
+
+//6.2 AutomatischeZertifikatePrototyp.kt
+// – Leerer Service (wird vom System gehalten)
+
+package com.deinunternehmen.cert_manager_automonimport android.app.Service
+import android.content.Intent
+import android.os.IBinder
+import android.util.Logprivate const val TAG = "CertManagerService"class AutomatischeZertifikatePrototyp : Service() {override fun onCreate() {
+    super.onCreate()
+    Log.d(TAG, "Service created")}override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    Log.d(TAG, "Service started – WorkManager does the heavy lifting")
+    // Wir starten nichts hier selbst; WorkManager übernimmt die Wiederholungen.
+
+    return START_STICKY}override fun onBind(intent: Intent?): IBinder? = nulloverride fun onDestroy() {
+    super.onDestroy()
+    Log.d(TAG, "Service destroyed")}}
+
+
+//6.3 CertMonitorWorker.kt
+// – WorkManager‑Task, prüft Anomalien und ruft Erneuerung auf
+
+package com.deinunternehmen.cert_manager_automonimport android.content.Context
+
+import android.util.Log
+import androidx.work.CoroutineWorker
+import androidx.work.WorkerParametersprivate const val WORKER_TAG = "CertMonitorWorker"class CertMonitorWorker(
+    appContext: Context,
+    params: WorkerParameters
+) : CoroutineWorker(appContext, params) {override suspend fun doWork(): Result {
+    Log.d(WORKER_TAG, "Periodic check started")
+    val detector = AnomalyDetector(appContext)
+    return if (detector.isSuspicious()) {
+        Log.i(WORKER_TAG, "Anomaly detected → renewing certificate")
+        CertRenewalManager(appContext).renewCertificate()
+        Result.success()
+    } else {
+        Log.d(WORKER_TAG, "No anomaly – nothing to do")
+        Result.success()
+    }}}
+
+
+
+//6.4 AnomalyDetector.kt
+// – einfache Heuristik (kann erweitert werden)
+
+package com.deinunternehmen.cert_manager_automonimport android.content.Context
+
+import android.content.SharedPreferences
+import android.util.Logprivate const val PREFS_NAME = "cert_manager_prefs"
+private const val KEY_FAIL_COUNT = "fail_cnt"
+private const val KEY_LAST_TS = "last_ts"class AnomalyDetector(private val ctx: Context) {private val prefs: SharedPreferences =
+    ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+/** * Beispiel‑Heuristik: >5 fehlgeschlagene Logins innerhalb von 10 Minuten.
+ * Du kannst weitere Checks (Netzwerk‑GeoIP, File‑Hash, Root‑Erkennung, …) hinzufügen. 
+*/fun isSuspicious(): Boolean {
+    val now = System.currentTimeMillis()
+    val lastTs = prefs.getLong(KEY_LAST_TS, 0L)
+    // Reset‑Logik: wenn das Zeitfenster abgelaufen ist, Zähler zurücksetzen
+    if (now - lastTs > 10 * 60_000) {
+        prefs.edit().putInt(KEY_FAIL_COUNT, 0).apply()
+        return false
+    }    
+    val fails = prefs.getInt(KEY_FAIL_COUNT, 0)
+    Log.d("AnomalyDetector", "Current fail count: $fails")
+    return fails >= 5}
+/** Aufruf aus deiner Login‑Logik,
+ um einen Fehlschlag zu zählen
+ */fun registerFailedLogin() {
+    val now = System.currentTimeMillis()
+    prefs.edit()
+        .putLong(KEY_LAST_TS, now)
+        .putInt(KEY_FAIL_COUNT, prefs.getInt(KEY_FAIL_COUNT, 0) + 1)
+        .apply()}}
+
+
+
+6.5 CertRenewalManager.kt
+ – Kern: CSR erzeugen, an CA senden, Zertifikat speichern
+package com.deinunternehmen.cert_manager_automonimport android.content.Context
+import android.util.Log
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+import java.security.KeyPairGenerator
+import java.security.Security
+import java.security.interfaces.RSAPrivateKey
+import java.security.interfaces.RSAPublicKey
+import javax.net.ssl.HttpsURLConnection
+import java.io.OutputStreamWriter
+import java.net.URLprivate const val LOG_TAG = "CertRenewalManager"
+private const val CA_ENDPOINT = "https://your-ca.example.com/api/renew"   
+// <- anpassen
+
+/**Verantwortlich für:Erzeugen eines frischen RSA‑Key‑Pairs
+Erstellen eines PKCS#10‑CSR (mit BouncyCastle)
+HTTPS‑POST zum CA‑Endpoint
+Sichere Ablage des zurückgelieferten PEM‑Zertifikats
+ im Android‑Keystore*/
+
+class CertRenewalManager(private val ctx: Context) { init {
+
+     //bei BouncyCastle registrieren, oder andere ähnliche Services aber Lumo AI hat Bouncy Castle empfohlen. 
+
+     if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
+         Security.addProvider(BouncyCastleProvider())
+     }
+ } fun renewCertificate() {
+     try {
+         // ----- 1️⃣ Key‑Pair erzeugen -----
+         val kpGen = KeyPairGenerator.getInstance("RSA", BouncyCastleProvider.PROVIDER_NAME)
+         kpGen.initialize(2048)
+         val keyPair = kpGen.generateKeyPair()
+         val pubKey = keyPair.public as RSAPublicKey
+         val privKey = keyPair.private as RSAPrivateKey
+// ----- 2️⃣ CSR bauen -----
+     val csrPem = CryptoHelper.createCsr(pubKey, privKey, "CN=cert_manager_automon")
+     // ----- 3️⃣ CSR an CA schicken -----
+     val returnedPem = postCsrToCa(csrPem)
+     // ----- 4️⃣ Zertifikat im Keystore sichern -----
+     CertStorage.storeCertificate(ctx, returnedPem, privKey)
+     Log.i(LOG_TAG, "Certificate successfully renewed and stored.") } catch (e: Exception) {
+     Log.e(LOG_TAG, "Certificate renewal failed", e) } } private fun postCsrToCa(csrPem: String): String {
+     val url = URL(CA_ENDPOINT)
+     val conn = (url.openConnection() as HttpsURLConnection).apply {
+         requestMethod = "POST"
+         setRequestProperty("Content-Type", "application/pkcs10")
+         doOutput = true
+         // Optional: Mutual TLS – hier könntest du ein Client‑Zertifikat aus dem Keystore laden
+
+     }OutputStreamWriter(conn.outputStream).use { it.write(csrPem)
+ } val responseCode = conn.resp if (responseCode != HttpsURLConnection.HTTP_OK) {
+     throw IllegalStateException("CA responded with HTTP $responseCode") }
+ return conn.inputStream.bufferedReader().use { it.readText() }
+    // PEM‑Zertifikat
+ }}
+
+
+//6.6 CryptoHelper.kt
+// – Hilfsobjekt zum Erzeugen des CSR
+
+package com.deinunternehmen.cert_manager_automonimport org.bouncycastle.asn1.x500.X500Name
+import org.bouncycastle.pkcs.PKCS10CertificationRequestBuilder
+import org.bouncycastle.pkcs.jcajce.JcaPKCS10CertificationRequestBuilder
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
+import org.bouncycastle.util.io.pem.PemObject
+import org.bouncycastle.util.io.pem.PemWriter
+import java.io.StringWriter
+import java.security.interfaces.RSAPrivateKey
+import java.security.interfaces.RSAPublicKeyobject CryptoHelper {
+
+/** * Erstellt einen PEM‑kodierten PKCS#10‑CSR.
+ * * @param pubKey  RSA‑Public‑Key
+ * @param privKey RSA‑Private‑Key
+ (zum Signieren)
+ * @param subjectDn DN‑String, 
+z. B. "CN=cert_manager_automon" */
+
+
+fun createCsr(
+    pubKey: RSAPublicKey,
+    privKey: RSAPrivateKey,
+    subjectDn: String): String {
+    val subject = X500Name(subjectDn)
+    val builder: PKCS10CertificationRequestBuilder = 
+       JcaPKCS10CertificationRequestBuilder(subject, pubKey)
+    val signer = JcaContentSignerBuilder("SHA256withRSA").build(privKey)
+    val csr = builder.build(signer)
+    // PEM‑Kodierung
+    val sw = StringWriter()
+    PemWriter(sw).use { pw ->
+        pw.writeObject(PemObject("CERTIFICATE REQUEST", csr.encoded))
+    }
+    return sw.toString()}}
+
+
+//6.7 CertStorage.kt
+// – Speichern des Zertifikats im Android‑Keystore
+
+package com.deinunternehmen.cert_manager_automonimport
+ android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import java.security.KeyPairGenerator
+import java.security.KeyStore
+import java.security.PrivateKey
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificateobject
+ CertStorage {private const val KEYSTORE_ALIAS = "cert_manager_automon_key"private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+
+/** * Legt das private RSA‑Key‑Pair
+ (falls noch nicht existent)
+ in den * hardware‑gesicherten Android‑Keystore
+ und speichert das erhaltene * X.509‑Zertifikat
+ darunter. */
+
+fun storeCertificate(
+    ctx: android.content.Context,
+    pemCert: String,
+    privateKey: PrivateKey) {
+    val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+    // 1️⃣ Key‑Pair im Keystore erzeugen (falls noch nicht vorhanden)
+    if (!ks.containsAlias(KEYSTORE_ALIAS)) {
+        val spec = KeyGenParameterSpec.Builder(
+            KEYSTORE_ALIAS,
+            KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
+        )
+            .setAlgorithmParameterSpec(java.security.spec.RSAKeyGenParameterSpec(2048, java.math.BigInteger("65537")))
+            .setDigests(KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA512)
+            .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1)
+            .build()
+        val kpg = KeyPairGenerator.getInstance("RSA", ANDROID_KEYSTORE)
+        kpg.initialize(spec)
+        kpg.generateKeyPair()
+   1️⃣// legt das Private‑Key im Keystore an
+    }
+    // 2️⃣ PEM‑Zertifikat parsen
+    val cf = CertificateFactory.getInstance("X.509")
+    val cert = cf.generateCertificate(pemCert.byteInputStream()) as X509Certificate
+    // 3️⃣ Zertifikat‑Chain (hier nur ein Zertifikat) im Keystore hinterlegen
+    ks.setEntry(
+        KEYSTORE_ALIAS,
+        KeyStore.PrivateKeyEntry(privateKey, arrayOf(cert)),
+        null
+    )}
+/** Optional: Zertifikat aus dem Keystore holen 
+*/fun getCertificate(): X509Certificate? {
+    val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+    val entry = ks.getEntry
